@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import fcntl
+import json
+import os
+from pathlib import Path
 from typing import ClassVar, cast
 
 import torch
@@ -14,9 +18,13 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
+
+logger = init_logger(__name__)
+_FP8_E4M3_MAX = 448.0
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -124,10 +132,158 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         return False
 
 
+
+def _apply_qsa_kv_scales(
+    layer: nn.Module, k_scale: float, v_scale: float, source: str
+) -> None:
+    """Write per-tensor FP8 KV scales onto the QSA owner (buffer + host floats)."""
+    k_scale = float(k_scale)
+    v_scale = float(v_scale)
+    if hasattr(layer, "_k_scale"):
+        layer._k_scale.fill_(k_scale)
+    if hasattr(layer, "_v_scale"):
+        layer._v_scale.fill_(v_scale)
+    layer._k_scale_float = k_scale
+    layer._v_scale_float = v_scale
+    if hasattr(layer, "_k_scale_cpu"):
+        layer._k_scale_cpu.fill_(k_scale)
+    if hasattr(layer, "_v_scale_cpu"):
+        layer._v_scale_cpu.fill_(v_scale)
+    logger.info(
+        "QSA FP8 KV scales on %s from %s: k_scale=%.6g v_scale=%.6g",
+        getattr(layer, "layer_name", type(layer).__name__),
+        source,
+        k_scale,
+        v_scale,
+    )
+
+
+def _sync_qsa_kv_scale_floats(layer: nn.Module) -> None:
+    """Keep host floats in sync with the persistent scale buffers after load."""
+    if hasattr(layer, "_k_scale"):
+        layer._k_scale_float = float(layer._k_scale.item())
+        if hasattr(layer, "_k_scale_cpu"):
+            layer._k_scale_cpu.fill_(layer._k_scale_float)
+    if hasattr(layer, "_v_scale"):
+        layer._v_scale_float = float(layer._v_scale.item())
+        if hasattr(layer, "_v_scale_cpu"):
+            layer._v_scale_cpu.fill_(layer._v_scale_float)
+
+
+def _maybe_load_qsa_kv_scales_file(layer: nn.Module) -> bool:
+    """Load scales from VLLM_QSA_KV_SCALES_PATH JSON if present."""
+    path = os.environ.get("VLLM_QSA_KV_SCALES_PATH", "").strip()
+    if not path or not os.path.isfile(path):
+        return False
+    data = json.loads(Path(path).read_text())
+    layers = data.get("layers", data)
+    layer_id = getattr(layer, "_qsa_layer_id", getattr(layer, "layer_idx", None))
+    keys: list[str] = []
+    if layer_id is not None:
+        keys.append(str(layer_id))
+    name = getattr(layer, "layer_name", None)
+    if name:
+        keys.append(name)
+    entry = None
+    for k in keys:
+        if k in layers:
+            entry = layers[k]
+            break
+    if entry is None:
+        return False
+    if "k_scale" in entry and "v_scale" in entry:
+        k_scale, v_scale = float(entry["k_scale"]), float(entry["v_scale"])
+    elif "k_amax" in entry and "v_amax" in entry:
+        k_scale = max(float(entry["k_amax"]), 1e-6) / _FP8_E4M3_MAX
+        v_scale = max(float(entry["v_amax"]), 1e-6) / _FP8_E4M3_MAX
+    else:
+        return False
+    _apply_qsa_kv_scales(layer, k_scale, v_scale, path)
+    return True
+
+
+def _finalize_qsa_kv_calib(layer: nn.Module) -> None:
+    k_amax = float(getattr(layer, "_qsa_k_amax", 0.0))
+    v_amax = float(getattr(layer, "_qsa_v_amax", 0.0))
+    margin = float(os.environ.get("VLLM_QSA_KV_CALIB_MARGIN", "1.25") or "1.25")
+    k_scale = max(k_amax * margin, 1e-6) / _FP8_E4M3_MAX
+    v_scale = max(v_amax * margin, 1e-6) / _FP8_E4M3_MAX
+    _apply_qsa_kv_scales(layer, k_scale, v_scale, "online-calib")
+    out = os.environ.get("VLLM_QSA_KV_CALIB_OUT", "").strip()
+    if not out:
+        return
+    layer_id = getattr(layer, "_qsa_layer_id", getattr(layer, "layer_idx", None))
+    key = str(
+        layer_id if layer_id is not None else getattr(layer, "layer_name", "unknown")
+    )
+    entry = {
+        "k_amax": k_amax,
+        "v_amax": v_amax,
+        "k_scale": k_scale,
+        "v_scale": v_scale,
+        "layer_name": getattr(layer, "layer_name", None),
+    }
+
+    def _write() -> None:
+        data: dict = {"layers": {}}
+        if Path(out).is_file():
+            try:
+                data = json.loads(Path(out).read_text())
+                data.setdefault("layers", {})
+            except Exception:
+                data = {"layers": {}}
+        data["layers"][key] = entry
+        data["fp8_e4m3_max"] = _FP8_E4M3_MAX
+        Path(out).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    lock_path = out + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            _write()
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    logger.info("QSA FP8 KV calib wrote layer %s -> %s", key, out)
+
+
 class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     """Run paged sparse GQA with the QSA Triton kernel."""
 
     supports_dcp: bool = False
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        # Optional online absmax collection for offline FP8 KV scale files.
+        remaining = getattr(layer, "_qsa_kv_calib_remaining", 0)
+        warmup = int(getattr(layer, "_qsa_kv_calib_warmup_remaining", 0))
+        # .item() syncs would invalidate CUDA graph capture.
+        if (remaining > 0 or warmup > 0) and key.numel() > 0 and not torch.cuda.is_current_stream_capturing():
+            n_all = min(int(slot_mapping.numel()), int(key.shape[0]))
+            offset = 0
+            if warmup > 0:
+                take = min(n_all, warmup)
+                layer._qsa_kv_calib_warmup_remaining = warmup - take
+                offset = take
+            usable = n_all - offset
+            if remaining > 0 and usable > 0:
+                n = min(usable, remaining)
+                sl = slice(offset, offset + n)
+                k_abs = key[sl].detach().float().abs().amax().item()
+                v_abs = value[sl].detach().float().abs().amax().item()
+                layer._qsa_k_amax = max(float(getattr(layer, "_qsa_k_amax", 0.0)), k_abs)
+                layer._qsa_v_amax = max(float(getattr(layer, "_qsa_v_amax", 0.0)), v_abs)
+                layer._qsa_kv_calib_remaining = remaining - n
+                if layer._qsa_kv_calib_remaining <= 0:
+                    _finalize_qsa_kv_calib(layer)
+        super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
     supports_pcp: bool = False
 
     def __init__(
@@ -385,6 +541,33 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
+        self._qsa_layer_id = int(layer_id)
+        # Prefer checkpoint-loaded buffers; optional JSON overrides (calib output).
+        if not _maybe_load_qsa_kv_scales_file(self):
+            _sync_qsa_kv_scale_floats(self)
+        calib_tokens = int(os.environ.get("VLLM_QSA_KV_CALIB_TOKENS", "0") or "0")
+        if calib_tokens > 0 and os.environ.get("VLLM_QSA_KV_CALIB_OUT", "").strip():
+            self._qsa_kv_calib_remaining = calib_tokens
+            self._qsa_kv_calib_warmup_remaining = int(
+                os.environ.get("VLLM_QSA_KV_CALIB_WARMUP_TOKENS", "4096") or "0"
+            )
+            self._qsa_k_amax = 0.0
+            self._qsa_v_amax = 0.0
+            logger.info(
+                "QSA FP8 KV calib armed on layer %s for %d tokens "
+                "(skip first %d warmup) -> %s",
+                self.layer_name,
+                calib_tokens,
+                self._qsa_kv_calib_warmup_remaining,
+                os.environ.get("VLLM_QSA_KV_CALIB_OUT"),
+            )
+        elif self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            logger.info(
+                "QSA FP8 KV scales on %s: k_scale=%.6g v_scale=%.6g",
+                self.layer_name,
+                float(self._k_scale_float),
+                float(self._v_scale_float),
+            )
 
         self.attn_backend = Qwen4ExpQSAFlashAttentionBackend
         self.impl = Qwen4ExpQSAFlashAttentionImpl(
@@ -430,6 +613,29 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype | None = None) -> None:
+        # Checkpoint may have filled _k_scale/_v_scale buffers via
+        # _remap_qsa_cache_scale_name; host floats are not auto-synced unless
+        # BaseKVCacheMethod runs (QSA does not use that path).
+        if os.environ.get("VLLM_QSA_KV_SCALES_PATH", "").strip():
+            _maybe_load_qsa_kv_scales_file(self)
+        else:
+            _sync_qsa_kv_scale_floats(self)
+        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            logger.info(
+                "QSA FP8 KV scales after weight load on %s: k_scale=%.6g v_scale=%.6g",
+                self.layer_name,
+                float(self._k_scale_float),
+                float(self._v_scale_float),
+            )
+        parent = super()
+        if hasattr(parent, "process_weights_after_loading"):
+            try:
+                parent.process_weights_after_loading(act_dtype)  # type: ignore[misc]
+            except TypeError:
+                parent.process_weights_after_loading()  # type: ignore[misc]
+
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return FullAttentionSpec(

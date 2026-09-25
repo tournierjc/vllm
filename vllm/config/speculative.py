@@ -1563,6 +1563,30 @@ class SpeculativeConfig:
                     )
                 )
 
+        # Dict --hf-overrides are intentionally not forwarded to the draft
+        # ModelConfig (YaRN rope and similar are target-only). But
+        # index_share_for_mtp_iteration is read only from the *draft*
+        # hf_config, so a CLI dict override for that one key would otherwise
+        # be a silent no-op. Lift just that key (top-level or nested under
+        # text_config) when the SpeculativeConfig field was left unset.
+        if self.index_share_for_mtp_iteration is None and self.method == "mtp":
+            target_overrides = getattr(
+                self.target_model_config, "hf_overrides", None
+            )
+            if isinstance(target_overrides, dict):
+                lifted = target_overrides.get("index_share_for_mtp_iteration")
+                if lifted is None:
+                    text_ov = target_overrides.get("text_config")
+                    if isinstance(text_ov, dict):
+                        lifted = text_ov.get("index_share_for_mtp_iteration")
+                if lifted is not None:
+                    self.index_share_for_mtp_iteration = bool(lifted)
+                    logger.info(
+                        "Lifted index_share_for_mtp_iteration=%s from target "
+                        "dict hf_overrides onto the draft MTP config",
+                        self.index_share_for_mtp_iteration,
+                    )
+
         if self.index_share_for_mtp_iteration is not None:
             if self.method != "mtp" or self.draft_model_config is None:
                 raise ValueError(
@@ -1570,6 +1594,10 @@ class SpeculativeConfig:
                 )
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
+            )
+            logger.info(
+                "MTP draft index_share_for_mtp_iteration=%s",
+                self.index_share_for_mtp_iteration,
             )
 
         if (

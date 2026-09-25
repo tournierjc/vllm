@@ -33,6 +33,13 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             and hasattr(draft_model.model, "set_skip_topk")
             and hasattr(draft_model.model, "compact_topk_indices")
         )
+        if self.share_mtp_topk_indices:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "MTP index share: index_share_for_mtp_iteration ACTIVE "
+                "(draft will reuse step-0 QSA indices on later MTP steps)"
+            )
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
